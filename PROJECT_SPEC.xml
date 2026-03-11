@@ -1,0 +1,143 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Project name="Bayesian_Atari_Lunar_Lander_ALE" language="Python">
+
+  <!-- ================================================================== -->
+  <!--  OVERVIEW                                                           -->
+  <!-- ================================================================== -->
+  <Overview>
+    An autonomous agent for the raw Atari 2600 Lunar Lander ROM using ale-py.
+    The project bypasses Gymnasium and Deep RL libraries to implement a
+    "Physics-First" control law.  We use Bayesian Inference (Kalman Filter)
+    to estimate continuous state from noisy 8-bit RAM, and a Decision-
+    Theoretic policy to pick actions based on Expected Utility.
+  </Overview>
+
+  <!-- ================================================================== -->
+  <!--  ENVIRONMENT                                                        -->
+  <!-- ================================================================== -->
+  <Environment>
+    <API>
+      from ale_py import ALEInterface, roms
+      ale = ALEInterface()
+      ale.loadROM(roms.get_rom_path("lunar_lander"))
+      ale.reset_game()
+      reward = ale.act(action)       # Action Space: 0=NOOP, 1=Left, 2=Main, 3=Right
+      ram    = ale.getRAM()          # 128-byte state
+    </API>
+
+    <Observation format="RAM_STATE">
+      <Field addr="0xA9" name="y_pos" desc="Discrete Altitude (8-bit unsigned)"/>
+      <Field addr="0xA4" name="y_vel" desc="Vertical Velocity (8-bit signed)"/>
+      <Field addr="0xA2" name="x_vel" desc="Horizontal Velocity (8-bit signed)"/>
+      <Field addr="0x90" name="angle" desc="Orientation (8-bit signed, 0=upright)"/>
+      <Note>RAM values are quantized integers.  Kalman Filtering is required
+            to infer smooth continuous physics.</Note>
+    </Observation>
+  </Environment>
+
+  <!-- ================================================================== -->
+  <!--  ARCHITECTURE                                                       -->
+  <!-- ================================================================== -->
+  <Architecture>
+
+    <!-- ========== LAYER 1: Kalman Inference ========================== -->
+    <Layer name="KalmanInference">
+      <Purpose>
+        Treat jumpy RAM bytes as noisy observations Z.  Maintain a posterior
+        belief N(mu, P) over the hidden continuous state [y, y_dot, x_dot, angle].
+      </Purpose>
+
+      <PredictionStep>
+        x_pred = A · x + b(action)       (Newtonian kinematics)
+        P_pred = A · P · A^T + Q
+      </PredictionStep>
+
+      <UpdateStep>
+        y      = z − H · x_pred          (innovation)
+        S      = H · P_pred · H^T + R    (innovation covariance)
+        K      = P_pred · H^T · S^{-1}   (Kalman Gain)
+        x_upd  = x_pred + K · y          (posterior mean)
+        P_upd  = (I − K · H) · P_pred    (posterior covariance)
+
+        This IS the Bayesian update:
+            P(State | Obs)  ∝  P(Obs | State) · P(State)
+      </UpdateStep>
+
+      <Implementation file="kalman_filter.py">
+        class KalmanFilter:
+            reset(z0)
+            predict(action)               # prior
+            update(z)                     # posterior
+            predict_state(action) -> mu   # hypothetical (no mutation)
+      </Implementation>
+    </Layer>
+
+    <!-- ========== LAYER 2: Heuristic Policy ========================== -->
+    <Layer name="HeuristicPolicy">
+      <Purpose>
+        Pick the action that maximises Expected Utility for the next frame.
+      </Purpose>
+
+      <DecisionRule>
+        For each action a in {0,1,2,3}:
+          1. Run Kalman 'predict_state' to see where the lander goes.
+          2. U(a) = -w_vy·|y_dot| - w_vx·|x_dot| - w_angle·|angle| - fuel(a).
+          3. Choose a* = argmax U(a).
+      </DecisionRule>
+
+      <Implementation file="bayes_agent.py">
+        class BayesianLanderAgent:
+            select_action() -> int
+            safety_score()  -> float   (for calibration metrics)
+      </Implementation>
+    </Layer>
+
+    <!-- ========== LAYER 3: Validation Suite ========================== -->
+    <Layer name="ValidationSuite">
+      <Component name="Calibration">
+        Plot Predicted Safety Probability vs. Empirical Landing Success Rate.
+        Brier Score and Expected Calibration Error (ECE).
+      </Component>
+      <Component name="PrecisionRecall">
+        Sweep threshold on P(Crash) and plot Precision-Recall curve for
+        'Safe Landing' vs 'Crash' classifications.
+      </Component>
+      <Component name="PoissonModeling">
+        Explicit Poisson PMF + Knuth sampler for offline event-rate analysis.
+      </Component>
+      <Component name="NegativeBinomial">
+        Fit main-engine frame counts per episode to a Negative Binomial
+        distribution via method-of-moments.  Estimate P(FuelDepleted).
+      </Component>
+    </Layer>
+
+  </Architecture>
+
+  <!-- ================================================================== -->
+  <!--  FILE STRUCTURE                                                     -->
+  <!-- ================================================================== -->
+  <Files>
+    <File name="config.py"          desc="All hyperparameters (ALE, RAM addresses, Kalman noise, utility weights)."/>
+    <File name="env_wrapper.py"     desc="Wrapper around ALEInterface; extracts RAM bytes to float observations."/>
+    <File name="kalman_filter.py"   desc="4-D Kalman filter: predict + update.  Explicit P(S|O) logic."/>
+    <File name="bayes_agent.py"     desc="Agent: Kalman state estimation + utility-based action selection."/>
+    <File name="reward_model.py"    desc="Reward decomposition (fuel, landing, crash penalty)."/>
+    <File name="fuel_model.py"      desc="Negative Binomial fit and PMF from scratch."/>
+    <File name="poisson_utils.py"   desc="Poisson PMF + Knuth sampler (offline analysis)."/>
+    <File name="metrics.py"         desc="Calibration, Brier, ECE, Precision/Recall, EV-vs-return."/>
+    <File name="train.py"           desc="Main loop: episodes, logging, metrics, plots."/>
+    <File name="requirements.txt"   desc="ale-py, numpy, matplotlib."/>
+    <File name="README.md"          desc="Project overview, install, run instructions."/>
+  </Files>
+
+  <!-- ================================================================== -->
+  <!--  KEY CONSTRAINT                                                     -->
+  <!-- ================================================================== -->
+  <Constraint>
+    - NO PyTorch, TensorFlow, or Scikit-Learn.
+    - All Bayesian updates and matrix math (Kalman) must be implemented
+      using NumPy only.
+    - Must explicitly show the P(S | O) update logic in the code.
+  </Constraint>
+
+</Project>
