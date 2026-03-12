@@ -70,6 +70,9 @@ class KalmanFilter:
         # ---- Noise covariances ----
         self.Q = np.eye(self.STATE_DIM) * cfg.process_noise_std ** 2
         self.R = np.eye(self.OBS_DIM)   * cfg.obs_noise_std ** 2
+        # Inflate x-observation noise so the filter is skeptical of
+        # small horizontal jitter → fewer twitchy side-engine firings.
+        self.R[0, 0] = cfg.obs_noise_x ** 2
 
         # ---- Belief state ----
         self.mu = np.zeros(self.STATE_DIM, dtype=np.float64)

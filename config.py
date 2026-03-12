@@ -26,6 +26,7 @@ class KalmanConfig:
     dt: float = 0.02
     process_noise_std: float = 0.05
     obs_noise_std: float = 0.02
+    obs_noise_x: float = 0.05          # inflated x-noise → skeptical of small x jitter
     gravity: float = -0.027
     thrust_main: float = 0.030
     thrust_lateral: float = 0.010
@@ -43,7 +44,8 @@ class UtilityWeights:
     center_gain: float = 0.10        # target_vx = -center_gain * x (very gentle)
     fuel_main: float = 0.01
     fuel_side: float = 0.003
-    vy_fire_threshold: float = -0.35 # hard override for fast descent
+    braking_g_eff: float = 0.003     # net vy deceleration per frame from main engine
+    braking_safety: float = 1.0      # fire exactly at physics limit
     safety_scale: float = 8.0
     safety_shift: float = 0.5
 

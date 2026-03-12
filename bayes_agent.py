@@ -36,13 +36,19 @@ class BayesianLanderAgent:
     # ================================================================== #
     def select_action(self) -> int:
         """
-        If the lander is falling too fast, fire main engine immediately.
-        Otherwise pick the action with highest predicted utility.
+        Braking-distance override: if kinetic energy exceeds available
+        stopping distance (v² > 2·g_eff·altitude with safety margin),
+        fire main engine immediately.  Otherwise pick argmax U(a).
         """
-        vy = self.kf.state_mean[3]
+        mu = self.kf.state_mean
+        y, vy = mu[1], mu[3]
 
-        if vy < self.w.vy_fire_threshold:
-            return 2
+        if vy < 0 and y > 0:
+            # Braking distance in y-units: d = vy² · dt / (2 · g_eff)
+            dt = CONFIG.kalman.dt
+            braking_dist = vy ** 2 * dt / (2.0 * self.w.braking_g_eff)
+            if braking_dist > y / self.w.braking_safety:
+                return 2
 
         best_action  = 0
         best_utility = -np.inf
@@ -70,6 +76,10 @@ class BayesianLanderAgent:
         target_vy = -self.w.descent_gain * max(y, 0.0)
         target_vx = -self.w.center_gain * x
 
+        # Touchdown protocol (y < 0.15): commit to landing upright.
+        #   - Triple angle & angular-vel penalties (stay upright)
+        #   - Zero out horizontal centering (stop swinging)
+        #   - Keep vy penalty as-is (descent profile already slows near ground)
         fuel = 0.0
         if action == 2:
             fuel = self.w.fuel_main
