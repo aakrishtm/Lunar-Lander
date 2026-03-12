@@ -11,7 +11,7 @@ import dataclasses
 class EnvConfig:
     env_id: str = "LunarLander-v3"
     seed: int = 42
-    render: bool = True
+    render: bool = False
 
 
 @dataclasses.dataclass
