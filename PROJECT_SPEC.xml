@@ -1,143 +1,163 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<Project name="Bayesian_Atari_Lunar_Lander_ALE" language="Python">
+<Project name="Bayesian_Lunar_Lander_Gymnasium" language="Python">
 
-  <!-- ================================================================== -->
-  <!--  OVERVIEW                                                           -->
-  <!-- ================================================================== -->
   <Overview>
-    An autonomous agent for the raw Atari 2600 Lunar Lander ROM using ale-py.
-    The project bypasses Gymnasium and Deep RL libraries to implement a
-    "Physics-First" control law.  We use Bayesian Inference (Kalman Filter)
-    to estimate continuous state from noisy 8-bit RAM, and a Decision-
-    Theoretic policy to pick actions based on Expected Utility.
+    An autonomous agent for Gymnasium's LunarLander-v3.  Bypasses Deep RL
+    (PPO/DQN) to implement a Physics-First Bayesian control law.  We treat
+    the environment's 6 continuous observation fields as noisy sensors and
+    maintain a posterior belief via a Kalman Filter.  The agent picks actions
+    using Bayesian Decision Theory (maximising Expected Utility).
   </Overview>
 
-  <!-- ================================================================== -->
-  <!--  ENVIRONMENT                                                        -->
-  <!-- ================================================================== -->
   <Environment>
     <API>
-      from ale_py import ALEInterface, roms
-      ale = ALEInterface()
-      ale.loadROM(roms.get_rom_path("lunar_lander"))
-      ale.reset_game()
-      reward = ale.act(action)       # Action Space: 0=NOOP, 1=Left, 2=Main, 3=Right
-      ram    = ale.getRAM()          # 128-byte state
+      import gymnasium as gym
+      env = gym.make("LunarLander-v3", render_mode="human")
+      obs, info = env.reset(seed=42)
+      obs, reward, terminated, truncated, info = env.step(action)
+      env.close()
     </API>
 
-    <Observation format="RAM_STATE">
-      <Field addr="0xA9" name="y_pos" desc="Discrete Altitude (8-bit unsigned)"/>
-      <Field addr="0xA4" name="y_vel" desc="Vertical Velocity (8-bit signed)"/>
-      <Field addr="0xA2" name="x_vel" desc="Horizontal Velocity (8-bit signed)"/>
-      <Field addr="0x90" name="angle" desc="Orientation (8-bit signed, 0=upright)"/>
-      <Note>RAM values are quantized integers.  Kalman Filtering is required
-            to infer smooth continuous physics.</Note>
+    <Observation format="float64[8]">
+      <Field index="0" name="x"          desc="Horizontal position"/>
+      <Field index="1" name="y"          desc="Vertical position (altitude)"/>
+      <Field index="2" name="vx"         desc="Horizontal velocity"/>
+      <Field index="3" name="vy"         desc="Vertical velocity"/>
+      <Field index="4" name="angle"      desc="Lander angle (radians)"/>
+      <Field index="5" name="ang_vel"    desc="Angular velocity"/>
+      <Field index="6" name="left_leg"   desc="1.0 if left leg contact"/>
+      <Field index="7" name="right_leg"  desc="1.0 if right leg contact"/>
     </Observation>
+
+    <Constraint>
+      Treat the first 6 elements of obs as noisy observations Z_t for the
+      Kalman Filter.  Do not use obs directly for control; use the filter's
+      posterior mean (mu).
+    </Constraint>
   </Environment>
 
-  <!-- ================================================================== -->
-  <!--  ARCHITECTURE                                                       -->
-  <!-- ================================================================== -->
   <Architecture>
 
-    <!-- ========== LAYER 1: Kalman Inference ========================== -->
-    <Layer name="KalmanInference">
+    <Layer name="KalmanFilter" file="kalman_filter.py">
       <Purpose>
-        Treat jumpy RAM bytes as noisy observations Z.  Maintain a posterior
-        belief N(mu, P) over the hidden continuous state [y, y_dot, x_dot, angle].
+        Maintain a Gaussian posterior N(mu, P) over the 6-D continuous state
+        [x, y, vx, vy, angle, ang_vel].
       </Purpose>
-
-      <PredictionStep>
-        x_pred = A · x + b(action)       (Newtonian kinematics)
-        P_pred = A · P · A^T + Q
-      </PredictionStep>
-
-      <UpdateStep>
-        y      = z − H · x_pred          (innovation)
-        S      = H · P_pred · H^T + R    (innovation covariance)
-        K      = P_pred · H^T · S^{-1}   (Kalman Gain)
-        x_upd  = x_pred + K · y          (posterior mean)
-        P_upd  = (I − K · H) · P_pred    (posterior covariance)
-
-        This IS the Bayesian update:
-            P(State | Obs)  ∝  P(Obs | State) · P(State)
-      </UpdateStep>
-
-      <Implementation file="kalman_filter.py">
-        class KalmanFilter:
-            reset(z0)
-            predict(action)               # prior
-            update(z)                     # posterior
-            predict_state(action) -> mu   # hypothetical (no mutation)
+      <Implementation>
+        Prediction: x_pred = A x + b(action)   (Newtonian kinematics)
+        Update:     x_post = x_pred + K (z - H x_pred)   (Bayesian update)
+        All matrix math via NumPy only (no scipy, no filterpy).
       </Implementation>
     </Layer>
 
-    <!-- ========== LAYER 2: Heuristic Policy ========================== -->
-    <Layer name="HeuristicPolicy">
-      <Purpose>
-        Pick the action that maximises Expected Utility for the next frame.
-      </Purpose>
+    <Layer name="HeuristicPolicy" file="bayes_agent.py">
+
+      <UtilityFunction>
+        U(a) = -10 |vy| - 5 |vx| - 10 |angle| - 5 |x| - fuel(a)
+
+        fuel(a):
+          a=0 ->  0.00   (no-op)
+          a=1 -> -0.03   (side thruster)
+          a=2 -> -0.30   (main engine)
+          a=3 -> -0.03   (side thruster)
+
+        Evaluated on the PREDICTED next-state from the Kalman filter.
+      </UtilityFunction>
+
+      <DescentRatePriority>
+        Hard override: if current vy &lt; -0.2 (descending too fast), fire
+        main engine (action 2) immediately before evaluating utility.
+        This doubles down on the high w_vy penalty and ensures the bot
+        never free-falls into the pad.
+      </DescentRatePriority>
+
+      <PadTargeting>
+        The -5|x| term ensures the agent is always penalised for drifting
+        away from the pad centre (x=0), preventing off-screen drift.
+      </PadTargeting>
 
       <DecisionRule>
-        For each action a in {0,1,2,3}:
-          1. Run Kalman 'predict_state' to see where the lander goes.
-          2. U(a) = -w_vy·|y_dot| - w_vx·|x_dot| - w_angle·|angle| - fuel(a).
-          3. Choose a* = argmax U(a).
+        a* = argmax_a U(a)     (unless vy override fires)
       </DecisionRule>
 
-      <Implementation file="bayes_agent.py">
-        class BayesianLanderAgent:
-            select_action() -> int
-            safety_score()  -> float   (for calibration metrics)
-      </Implementation>
     </Layer>
 
-    <!-- ========== LAYER 3: Validation Suite ========================== -->
-    <Layer name="ValidationSuite">
+    <Layer name="SafetyModel" file="bayes_agent.py">
+      <CrashBiasedPrior>
+        P(Safe) is computed via a sigmoid over a "danger" metric derived
+        from the Kalman state:
+
+          danger = 10|vy| + 5|vx| + 10|angle| + 5|x|
+          P(Safe) = sigma(danger / 8.0 - 0.5)
+
+        The low shift (0.5) acts as a Laplace-style crash-biased prior,
+        equivalent to Beta(alpha_crash=3, beta_safe=1).  This means:
+
+          - At danger=0 (perfect state): P(Safe) ~ 0.62 (not 0.95)
+          - At danger=4 (modest flight):  P(Safe) ~ 0.50
+          - At danger=16 (rough state):   P(Safe) ~ 0.18
+
+        The agent is never overconfident in safety, which lowers both
+        ECE and Brier score compared to a neutral prior.
+      </CrashBiasedPrior>
+    </Layer>
+
+    <Layer name="ValidationSuite" file="metrics.py">
       <Component name="Calibration">
-        Plot Predicted Safety Probability vs. Empirical Landing Success Rate.
-        Brier Score and Expected Calibration Error (ECE).
+        Reliability diagram, Brier score, Expected Calibration Error.
       </Component>
       <Component name="PrecisionRecall">
-        Sweep threshold on P(Crash) and plot Precision-Recall curve for
-        'Safe Landing' vs 'Crash' classifications.
+        Precision-Recall curve for Safe vs Crash classification.
       </Component>
-      <Component name="PoissonModeling">
-        Explicit Poisson PMF + Knuth sampler for offline event-rate analysis.
+      <Component name="EVvsReturn">
+        Pearson correlation between predicted utility and realised return.
       </Component>
-      <Component name="NegativeBinomial">
-        Fit main-engine frame counts per episode to a Negative Binomial
-        distribution via method-of-moments.  Estimate P(FuelDepleted).
+      <Component name="NegativeBinomial" file="fuel_model.py">
+        Fit main-engine frame counts to NegBin via method-of-moments.
+      </Component>
+      <Component name="Poisson" file="poisson_utils.py">
+        Explicit PMF and Knuth sampler for offline event-rate analysis.
       </Component>
     </Layer>
 
   </Architecture>
 
-  <!-- ================================================================== -->
-  <!--  FILE STRUCTURE                                                     -->
-  <!-- ================================================================== -->
+  <TrainingLoop file="train.py">
+    env   = GymLunarLander()
+    agent = BayesianLanderAgent()
+
+    for episode in range(500):
+        obs, info = env.reset()
+        agent.reset(obs)
+
+        while not done:
+            p_crash = 1.0 - agent.safety_score()
+            action  = agent.select_action()     # vy override or argmax U
+            result  = env.step(action)           # step the REAL Gym env
+            agent.observe(action, result.obs)    # Kalman predict + update
+
+        log(crashed, fuel_counts, p_crash_per_step, episode_return)
+
+    # End: save calibration.png, precision_recall.png, NegBin fit.
+  </TrainingLoop>
+
   <Files>
-    <File name="config.py"          desc="All hyperparameters (ALE, RAM addresses, Kalman noise, utility weights)."/>
-    <File name="env_wrapper.py"     desc="Wrapper around ALEInterface; extracts RAM bytes to float observations."/>
-    <File name="kalman_filter.py"   desc="4-D Kalman filter: predict + update.  Explicit P(S|O) logic."/>
-    <File name="bayes_agent.py"     desc="Agent: Kalman state estimation + utility-based action selection."/>
-    <File name="reward_model.py"    desc="Reward decomposition (fuel, landing, crash penalty)."/>
-    <File name="fuel_model.py"      desc="Negative Binomial fit and PMF from scratch."/>
-    <File name="poisson_utils.py"   desc="Poisson PMF + Knuth sampler (offline analysis)."/>
-    <File name="metrics.py"         desc="Calibration, Brier, ECE, Precision/Recall, EV-vs-return."/>
-    <File name="train.py"           desc="Main loop: episodes, logging, metrics, plots."/>
-    <File name="requirements.txt"   desc="ale-py, numpy, matplotlib."/>
-    <File name="README.md"          desc="Project overview, install, run instructions."/>
+    <File name="config.py"          desc="All hyperparameters: Kalman noise, utility weights (10/5/10/5/0.3), vy threshold, safety sigmoid params."/>
+    <File name="env_wrapper.py"     desc="Thin wrapper around gym.make('LunarLander-v3'). No custom physics."/>
+    <File name="kalman_filter.py"   desc="6-D Kalman filter with Newtonian dynamics. Pure NumPy."/>
+    <File name="bayes_agent.py"     desc="Agent: Kalman + U(a) = -10|vy| -5|vx| -10|ang| -5|x| -fuel. Early vy fire. Crash-biased P(Safe)."/>
+    <File name="reward_model.py"    desc="Reward decomposition into fuel / landing / crash components."/>
+    <File name="fuel_model.py"      desc="Negative Binomial fit via method-of-moments."/>
+    <File name="poisson_utils.py"   desc="Poisson PMF and Knuth sampler (offline analysis only)."/>
+    <File name="metrics.py"         desc="Calibration, Brier, ECE, Precision/Recall, EV-vs-return. All from scratch."/>
+    <File name="train.py"           desc="Main loop: run episodes, log data, print metrics, save plots."/>
+    <File name="requirements.txt"   desc="gymnasium[box2d], numpy, matplotlib."/>
   </Files>
 
-  <!-- ================================================================== -->
-  <!--  KEY CONSTRAINT                                                     -->
-  <!-- ================================================================== -->
   <Constraint>
-    - NO PyTorch, TensorFlow, or Scikit-Learn.
-    - All Bayesian updates and matrix math (Kalman) must be implemented
-      using NumPy only.
-    - Must explicitly show the P(S | O) update logic in the code.
+    NO PyTorch, TensorFlow, or Scikit-Learn.
+    All Bayesian updates, matrix math, and statistical models are
+    implemented from scratch with NumPy and math.
   </Constraint>
 
 </Project>

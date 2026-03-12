@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 """
-Main training / data-collection loop for the Bayesian Atari Lunar Lander.
+Main training / data-collection loop for the Bayesian Lunar Lander.
 
-1. Creates the ALE environment and Bayesian agent (Kalman + utility).
-2. Runs episodes: agent picks actions via expected-utility maximisation,
-   Kalman filter smooths the noisy RAM observations every frame.
-3. Logs per-step crash probabilities and per-episode fuel usage / returns.
-4. Periodically computes and prints calibration, Brier, ECE, and PR metrics.
-5. At termination, fits a Negative Binomial to fuel counts and saves plots.
+1. Creates the Gymnasium environment and Bayesian agent (Kalman + utility).
+2. Runs episodes: agent picks actions, Kalman filter smooths observations.
+3. Logs per-step crash probabilities and per-episode fuel / returns.
+4. Periodically computes calibration, Brier, ECE, and PR metrics.
+5. At the end, fits a Negative Binomial to fuel counts and saves plots.
 """
 
 from typing import List
@@ -17,7 +16,7 @@ import numpy as np
 
 from bayes_agent import BayesianLanderAgent
 from config import CONFIG
-from env_wrapper import AtariLunarLander
+from env_wrapper import GymLunarLander
 from fuel_model import fit_negative_binomial, prob_fuel_depleted
 from metrics import (
     brier_score,
@@ -33,7 +32,7 @@ from metrics import (
 def run() -> None:
     cfg = CONFIG.training
 
-    env   = AtariLunarLander()
+    env   = GymLunarLander()
     agent = BayesianLanderAgent()
 
     # ---- accumulators ----
@@ -45,7 +44,7 @@ def run() -> None:
     fuel_counts:        List[int]   = []
 
     for ep in range(cfg.num_episodes):
-        obs, _ = env.reset()
+        obs, info = env.reset(seed=CONFIG.env.seed + ep)
         agent.reset(obs)
 
         total_reward  = 0.0
@@ -55,14 +54,12 @@ def run() -> None:
         step_utils: List[float] = []
 
         for _ in range(cfg.max_steps):
-            # Record predicted P(Crash) for this step
             p_crash = 1.0 - agent.safety_score()
             all_crash_probs.append(p_crash)
 
             action = agent.select_action()
             result = env.step(action)
 
-            # Kalman predict + update on the new observation
             agent.observe(action, result.obs)
 
             total_reward += result.reward
@@ -75,10 +72,10 @@ def run() -> None:
 
             step_utils.append(agent._evaluate_action(action))
 
-            if result.game_over:
+            if result.terminated or result.truncated:
                 break
 
-        # ---- end of episode bookkeeping ----
+        # ---- end-of-episode bookkeeping ----
         crashed = total_reward < cfg.safe_reward_threshold
         all_crash_outcomes.append(1 if crashed else 0)
         steps_per_episode.append(step_count)
@@ -136,12 +133,10 @@ def run() -> None:
         print(f"Fuel NegBin fit:  r={r_nb:.2f}  p={p_nb:.4f}")
         print(f"P(fuel > 500 frames) = {p_dep:.4f}")
 
+    env.close()
     print("Done.")
 
 
-# ------------------------------------------------------------------ #
-#  Helper: expand per-episode outcomes to per-step arrays             #
-# ------------------------------------------------------------------ #
 def _expand_outcomes(
     episode_outcomes: List[int],
     steps_per_episode: List[int],

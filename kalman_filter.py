@@ -1,20 +1,25 @@
 from __future__ import annotations
 
 """
-Kalman Filter for Atari Lunar Lander state estimation.
+Kalman Filter for LunarLander-v3 state estimation.
 
-Treats the 8-bit RAM bytes as noisy observations Z of an underlying
-continuous physics state.  Maintains a Gaussian posterior belief
-    N(mu, P)
-and updates it every frame using the standard Kalman equations.
+Treats the six continuous observation fields
+    [x, y, vx, vy, angle, angular_vel]
+as noisy sensor readings Z_t and maintains a Gaussian posterior belief
+
+    N(mu_t, P_t)
+
+updated every frame via the standard Kalman equations.
 
 This IS the explicit Bayesian update  P(S | O):
 
-    Prior      :  N(mu_pred, P_pred)       ← Prediction step (kinematics)
-    Likelihood :  N(z | H·x, R)            ← Observation model (RAM reading)
-    Posterior  :  N(mu_upd, P_upd)         ← Update step (Kalman gain)
+    Prior      :  N(mu_pred, P_pred)       <- Prediction step (kinematics)
+    Likelihood :  N(z | H x, R)            <- Observation model
+    Posterior  :  N(mu_upd, P_upd)         <- Update step (Kalman gain)
 
-    P(State | Observation) ∝ P(Observation | State) · P(State)
+    P(State | Observation)  ∝  P(Observation | State) · P(State)
+
+All matrix math is pure NumPy — no scipy, no filterpy.
 """
 
 import numpy as np
@@ -24,24 +29,24 @@ from config import CONFIG
 
 class KalmanFilter:
     """
-    4-D Kalman filter over state  x = [y, y_dot, x_dot, angle].
-
-    All matrix operations are pure NumPy — no scipy or filterpy.
+    6-D Kalman filter over state  x = [x, y, vx, vy, angle, ang_vel].
     """
 
-    STATE_DIM = 4
-    OBS_DIM = 4
+    STATE_DIM = 6
+    OBS_DIM = 6
 
     def __init__(self) -> None:
         cfg = CONFIG.kalman
-        self.dt = cfg.dt
+        dt = cfg.dt
 
         # ---- Dynamics: x_{t+1} = A x_t + b(action) ----
         self.A = np.array([
-            [1.0, cfg.dt, 0.0, 0.0],   # y += dt · y_dot
-            [0.0, 1.0,    0.0, 0.0],   # y_dot (gravity + thrust in b)
-            [0.0, 0.0,    1.0, 0.0],   # x_dot (thrust in b)
-            [0.0, 0.0,    0.0, 1.0],   # angle  (torque in b)
+            [1, 0, dt, 0,  0,  0 ],   # x  += dt · vx
+            [0, 1, 0,  dt, 0,  0 ],   # y  += dt · vy
+            [0, 0, 1,  0,  0,  0 ],   # vx  (modified by b)
+            [0, 0, 0,  1,  0,  0 ],   # vy  (gravity + thrust in b)
+            [0, 0, 0,  0,  1,  dt],   # θ  += dt · ω
+            [0, 0, 0,  0,  0,  1 ],   # ω   (torque in b)
         ], dtype=np.float64)
 
         g  = cfg.gravity
@@ -49,11 +54,14 @@ class KalmanFilter:
         tl = cfg.thrust_lateral
         tq = cfg.torque
 
+        # Control vectors calibrated against LunarLander-v3 frame deltas.
+        # Action 1 = left orientation engine  → pushes vx negative, ang_vel positive
+        # Action 3 = right orientation engine → pushes vx positive, ang_vel negative
         self._b = {
-            0: np.array([0.0, -g,       0.0,  0.0]),   # nothing
-            1: np.array([0.0, -g,      -tl,  -tq]),    # left thruster
-            2: np.array([0.0, -g + tm,  0.0,  0.0]),   # main engine
-            3: np.array([0.0, -g,       tl,   tq]),    # right thruster
+            0: np.array([0, 0,   0,  g,       0,   0 ]),   # nothing
+            1: np.array([0, 0, -tl,  g,       0,  tq]),    # left engine
+            2: np.array([0, 0,   0,  g + tm,  0,   0 ]),   # main engine
+            3: np.array([0, 0,  tl,  g,       0, -tq]),    # right engine
         }
 
         # ---- Observation model: z = H x + noise ----
@@ -65,22 +73,20 @@ class KalmanFilter:
 
         # ---- Belief state ----
         self.mu = np.zeros(self.STATE_DIM, dtype=np.float64)
-        self.P  = np.eye(self.STATE_DIM, dtype=np.float64) * 100.0
+        self.P  = np.eye(self.STATE_DIM, dtype=np.float64) * 1.0
 
     # ------------------------------------------------------------------ #
-    #  Initialise                                                         #
-    # ------------------------------------------------------------------ #
     def reset(self, z0: np.ndarray) -> None:
-        """Set the initial belief to the first observation with high uncertainty."""
+        """Initialise belief from the first observation."""
         self.mu = z0.copy().astype(np.float64)
-        self.P  = np.eye(self.STATE_DIM, dtype=np.float64) * 50.0
+        self.P  = np.eye(self.STATE_DIM, dtype=np.float64) * 0.1
 
     # ================================================================== #
     #  PREDICT  —  the PRIOR   P(x_t | z_{1:t-1}, a_{t-1})              #
     # ================================================================== #
     def predict(self, action: int) -> None:
         """
-        Propagate the belief one step forward under Newtonian kinematics.
+        Propagate belief one step forward via Newtonian kinematics.
 
             mu_pred = A · mu  +  b(action)
             P_pred  = A · P · A^T  +  Q
@@ -92,22 +98,17 @@ class KalmanFilter:
     # ================================================================== #
     #  UPDATE  —  the POSTERIOR   P(x_t | z_{1:t})                       #
     #                                                                     #
-    #  This is the Bayesian step:                                         #
     #      posterior ∝ likelihood  ×  prior                               #
-    #  where                                                              #
-    #      prior      = N(mu_pred, P_pred)                                #
-    #      likelihood = N(z | H · x, R)                                   #
-    #      posterior   = N(mu_upd,  P_upd)                                #
     # ================================================================== #
     def update(self, z: np.ndarray) -> None:
         """
-        Fuse the RAM observation with the predicted prior.
+        Fuse the Gymnasium observation with the predicted prior.
 
-        Innovation:          y = z  -  H · mu_pred
-        Innovation cov:      S = H · P_pred · H^T  +  R
-        Kalman Gain:         K = P_pred · H^T · S^{-1}
-        Posterior mean:      mu = mu_pred  +  K · y
-        Posterior cov:       P  = (I - K · H) · P_pred
+        Innovation:      y = z  −  H · mu_pred
+        Innovation cov:  S = H · P_pred · H^T  +  R
+        Kalman Gain:     K = P_pred · H^T · S^{-1}
+        Posterior mean:  mu = mu_pred  +  K · y
+        Posterior cov:   P  = (I − K · H) · P_pred
         """
         z = np.asarray(z, dtype=np.float64)
 
@@ -127,8 +128,6 @@ class KalmanFilter:
         b = self._b.get(action, self._b[0])
         return self.A @ self.mu + b
 
-    # ------------------------------------------------------------------ #
-    #  Read-only accessors                                                #
     # ------------------------------------------------------------------ #
     @property
     def state_mean(self) -> np.ndarray:

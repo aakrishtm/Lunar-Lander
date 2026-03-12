@@ -3,16 +3,11 @@ from __future__ import annotations
 """
 Bayesian Lunar Lander agent — Physics-First control law.
 
-Architecture
-------------
-1. **KalmanFilter** maintains a smoothed Gaussian posterior over
-   [y, y_dot, x_dot, angle] from noisy 8-bit RAM.
-2. For each candidate action a ∈ {0,1,2,3} we run a *hypothetical*
-   Kalman predict step to obtain the predicted next-state mean.
-3. We evaluate a utility function on each predicted state and pick
-   a* = argmax_a  U(a).
-4. A sigmoid-transformed "danger" metric provides a continuous
-   P(Safe) estimate used by the calibration / PR validation suite.
+1. KalmanFilter maintains a smoothed posterior over
+   [x, y, vx, vy, angle, ang_vel] from Gymnasium observations.
+2. For each candidate action we run a hypothetical Kalman predict
+   and evaluate a utility function on the predicted next-state.
+3. Pick a* = argmax_a U(a), with a descent-rate safety override.
 """
 
 import numpy as np
@@ -29,25 +24,26 @@ class BayesianLanderAgent:
         self.kf = KalmanFilter()
         self.w  = CONFIG.utility
 
-    def reset(self, z0: np.ndarray) -> None:
-        """Initialise the Kalman filter with the first RAM observation."""
-        self.kf.reset(z0)
+    def reset(self, obs: np.ndarray) -> None:
+        self.kf.reset(obs[:6])
 
-    def observe(self, action: int, z: np.ndarray) -> None:
-        """Run one predict → update cycle on the real observation."""
+    def observe(self, action: int, obs: np.ndarray) -> None:
         self.kf.predict(action)
-        self.kf.update(z)
+        self.kf.update(obs[:6])
 
     # ================================================================== #
-    #  Action selection  —  Expected Utility maximisation                 #
+    #  Action selection                                                   #
     # ================================================================== #
     def select_action(self) -> int:
         """
-        For each action a:
-            1. Hypothetically predict the next state.
-            2. Compute U(a) = -w_vy|y_dot| - w_vx|x_dot| - w_angle|angle| - fuel.
-            3. Return a* = argmax U(a).
+        If the lander is falling too fast, fire main engine immediately.
+        Otherwise pick the action with highest predicted utility.
         """
+        vy = self.kf.state_mean[3]
+
+        if vy < self.w.vy_fire_threshold:
+            return 2
+
         best_action  = 0
         best_utility = -np.inf
 
@@ -59,10 +55,20 @@ class BayesianLanderAgent:
 
         return best_action
 
+    # ================================================================== #
+    #  Utility function (altitude-aware descent profile)                   #
+    #                                                                      #
+    #  Target velocities scale with position so the lander follows a       #
+    #  controlled descent toward the pad rather than hovering.             #
+    #    target_vy = -descent_gain * y   (fall faster when high)           #
+    #    target_vx = -center_gain  * x   (move toward pad center)          #
+    # ================================================================== #
     def _evaluate_action(self, action: int) -> float:
-        """Score a candidate action via the predicted next-state."""
         predicted = self.kf.predict_state(action)
-        _, y_dot, x_dot, angle = predicted
+        x, y, vx, vy, angle, ang_vel = predicted
+
+        target_vy = -self.w.descent_gain * max(y, 0.0)
+        target_vx = -self.w.center_gain * x
 
         fuel = 0.0
         if action == 2:
@@ -71,32 +77,27 @@ class BayesianLanderAgent:
             fuel = self.w.fuel_side
 
         return (
-            - self.w.w_vy    * abs(y_dot)
-            - self.w.w_vx    * abs(x_dot)
-            - self.w.w_angle * abs(angle)
+            - self.w.w_vy      * (vy - target_vy) ** 2
+            - self.w.w_vx      * (vx - target_vx) ** 2
+            - self.w.w_angle   * angle ** 2
+            - self.w.w_ang_vel * ang_vel ** 2
+            - self.w.w_x       * x ** 2
             - fuel
         )
 
     # ================================================================== #
-    #  Safety score  —  used by the validation / metrics layer            #
+    #  P(Safe) — crash-biased sigmoid                                    #
     # ================================================================== #
     def safety_score(self) -> float:
-        """
-        Map the current Kalman state to P(Safe) ∈ (0, 1) via sigmoid.
-
-        danger = w_vy·|y_dot| + w_vx·|x_dot| + w_angle·|angle|
-        P(Safe) = σ(shift − danger / scale)
-
-        Calm states → high P(Safe),  violent states → low P(Safe).
-        """
-        _, y_dot, x_dot, angle = self.kf.state_mean
+        x, _y, vx, vy, angle, _ang_vel = self.kf.state_mean
 
         danger = (
-              self.w.w_vy    * abs(y_dot)
-            + self.w.w_vx    * abs(x_dot)
+              self.w.w_vy    * abs(vy)
+            + self.w.w_vx    * abs(vx)
             + self.w.w_angle * abs(angle)
+            + self.w.w_x     * abs(x)
         )
 
-        scale, shift = 20.0, 2.0
-        p_safe = 1.0 / (1.0 + np.exp(danger / scale - shift))
+        p_safe = 1.0 / (1.0 + np.exp(danger / self.w.safety_scale
+                                       - self.w.safety_shift))
         return float(np.clip(p_safe, 0.001, 0.999))
